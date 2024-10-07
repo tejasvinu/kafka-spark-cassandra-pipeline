@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO)
 # Kafka producer setup
 AIRFLOW_ORCHESTRATOR = True  # Determine orchestration provider
 records_per_second = 100  # Pass records per second dynamically
-run_for_seconds = 600  # Set runtime dynamically (e.g., 1 hour)
+run_for_seconds = 540  # Set runtime dynamically (e.g., 1 hour)
 KAFKA_HOSTS = [
     "localhost:9092",
     "localhost:9093",
@@ -81,18 +81,6 @@ def create_kafka_producer():
         retries=5,
         acks="all",
     )
-    # return KafkaProducer(
-    #     bootstrap_servers=KAFKA_HOSTS,
-    #     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    #     max_block_ms=5000,
-    #     batch_size=32768,
-    #     linger_ms=100,
-    #     compression_type="snappy",
-    #     buffer_memory=67108864,  # 64MB
-    #     max_in_flight_requests_per_connection=5,
-    #     retries=5,
-    #     acks=1,
-    # )
 
 
 def stream_weather_data(records_per_second, run_for_seconds):
@@ -100,7 +88,7 @@ def stream_weather_data(records_per_second, run_for_seconds):
     producer = None
     try:
         producer = create_kafka_producer()
-        logging.info(f"Started streaming weather data to Kafka topic 'weather_data'")
+        logging.info("Started streaming weather data to Kafka topic 'weather_data'")
 
         start_time = time.time()
         while True:
@@ -114,7 +102,7 @@ def stream_weather_data(records_per_second, run_for_seconds):
 
             time.sleep(1)
 
-        logging.info(f"Successfully completed data streaming to Kafka.")
+        logging.info("Successfully completed data streaming to Kafka.")
 
     except Exception as e:
         logging.error(f"Error occurred while streaming data to Kafka: {e}")
@@ -126,18 +114,12 @@ def stream_weather_data(records_per_second, run_for_seconds):
             logging.info("Kafka producer closed.")
 
 
-def run_spark_stream():
-    from spark_stream import start_spark_stream
-
-    start_spark_stream()
-
-
 if AIRFLOW_ORCHESTRATOR:
     # Airflow DAG definition
     with DAG(
         "weather_data_streaming",
         default_args=default_args,
-        schedule_interval=timedelta(minutes=30),
+        schedule_interval=timedelta(minutes=10),
         catchup=False,
         max_active_runs=1,
     ) as dag:
@@ -152,16 +134,6 @@ if AIRFLOW_ORCHESTRATOR:
             },
             execution_timeout=timedelta(minutes=15),
         )
-
-        # Spark streaming task
-        spark_streaming_task = PythonOperator(
-            task_id="process_data_with_spark",
-            python_callable=run_spark_stream,
-            execution_timeout=timedelta(minutes=30),
-        )
-
-        # Set task dependencies
-        kafka_streaming_task >> spark_streaming_task
 
 else:
     stream_weather_data(records_per_second, run_for_seconds)

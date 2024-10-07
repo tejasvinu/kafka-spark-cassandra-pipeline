@@ -13,11 +13,11 @@ This project implements a real-time data pipeline to simulate weather data, stre
     - [Prerequisites](#prerequisites)
     - [Clone the Repository](#clone-the-repository)
     - [Step-by-Step Installation](#step-by-step-installation)
+  - [Airflow DAG](#airflow-dag)
   - [Kafka Producer](#kafka-producer)
     - [Kafka Producer Configuration](#kafka-producer-configuration)
   - [Spark Streaming](#spark-streaming)
     - [Key Spark Functions:](#key-spark-functions)
-  - [Airflow DAG](#airflow-dag)
   - [Cassandra](#cassandra)
   - [Usage](#usage)
     - [Trigger the Pipeline](#trigger-the-pipeline)
@@ -94,9 +94,23 @@ cd kafka-spark-cassandra
 
    The DAG file is located in the `dags/` folder. When the DAG bag is loaded, you can trigger the `weather_data_streaming` DAG to start the streaming pipeline.
 
-   The DAG schedules the weather data generation, Kafka streaming, and Spark transformations.
+   The DAG schedules the weather data generation and Kafka streaming.
 
-4. **Access Cassandra**:
+4. **Access Kafka using Confluent Control Center**
+
+   Access the Kafka Cluster by navigating to [http://localhost:9021](http://localhost:9021) in your browser. Here you can view the overall status, throughput of the cluster, along with the details about the broker and the topics.
+   
+   From there you can navigate to the Topics to view the messages which are published to the topic as below:
+
+    ![Kafka-Topic](assets/kafka_topic.png)
+
+5. **Access Spark Cluster**
+
+   Access the Spark Driver by navigating to [http://localhost:9090](http://localhost:9090) in your browser. While the Spark UI can be accessed at [http://localhost:4041](http://localhost:4041) or [http://localhost:4042](http://localhost:4042) in your browser.
+
+    ![Spark-UI](assets/spark-ui.png)
+
+6. **Access Cassandra**:
 
    Cassandra is accessible at `localhost:9042`. You can connect to the Cassandra CLI using:
 
@@ -105,6 +119,21 @@ cd kafka-spark-cassandra
    ```
 
    The Spark job will automatically create the `weather_data` table in the `spark_streams` keyspace.
+
+    ![Cassandra](assets/cassandra.png)
+
+## Airflow DAG
+
+The DAG is responsible for orchestrating the pipeline, ensuring tasks are run in the correct order and at the correct intervals.
+
+- **DAG File Location**: `dags/weather_data_streaming.py`
+- **Task**: The DAG contains a PythonOperator that runs the `stream_weather_data` function.
+
+To trigger the DAG manually:
+
+1. Go to [http://localhost:8080](http://localhost:8080).
+2. Trigger the `weather_data_streaming` DAG from the Airflow UI.
+
 
 ## Kafka Producer
 
@@ -134,22 +163,16 @@ Spark Streaming reads the weather data from Kafka, flattens the nested JSON stru
 
 The Spark script is located in `spark_stream.py`.
 
+To start Spark processing execute the command
+
+```bash
+python spark_stream.py
+```
+
 ### Key Spark Functions:
 
 - **Data Transformation**: Nested JSON fields like `location` (containing city, country, latitude, and longitude) are flattened.
 - **Cassandra Table Creation**: The table `weather_data` is created automatically in the `spark_streams` keyspace.
-
-## Airflow DAG
-
-The DAG is responsible for orchestrating the pipeline, ensuring tasks are run in the correct order and at the correct intervals.
-
-- **DAG File Location**: `dags/weather_data_streaming.py`
-- **Task**: The DAG contains a PythonOperator that runs the `stream_weather_data` function.
-
-To trigger the DAG manually:
-
-1. Go to [http://localhost:8080](http://localhost:8080).
-2. Trigger the `weather_data_streaming` DAG from the Airflow UI.
 
 ## Cassandra
 
@@ -181,7 +204,8 @@ Once the services are up and running, you can trigger the entire data pipeline f
 
 1. Access the Airflow UI at [http://localhost:8080](http://localhost:8080).
 2. Trigger the `weather_data_streaming` DAG.
-3. Monitor the task logs to ensure the data is being streamed from Kafka, processed by Spark, and stored in Cassandra.
+3. Monitor the task logs to ensure the data is being streamed from Kafka. 
+4. Start the Spark streaming job, and monitor the data stored in Cassandra from both Spark UI as well as Cassandra CLI.
 
 ### Accessing Data in Cassandra
 
@@ -191,10 +215,23 @@ You can query the weather data stored in Cassandra using `cqlsh`:
 docker exec -it cassandra cqlsh -u cassandra -p cassandra localhost 9042
 ```
 
-Run a query like:
+In order to view the table properties, run the below query:
+
+```sql
+DESCRIBE spark_streams.weather_data;
+```
+
+
+In order to view the data manually, you can run a query like:
 
 ```sql
 SELECT * FROM spark_streams.weather_data LIMIT 10;
+```
+
+In order to view the number of records in the Cassandra table, you can run a query like:
+
+```sql
+SELECT COUNT(*) FROM spark_streams.weather_data;
 ```
 
 ## License
