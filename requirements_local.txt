@@ -1,0 +1,6 @@
+kafka-python
+apache-airflow
+cassandra-driver
+spark
+pyspark
+faker
