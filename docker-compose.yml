@@ -53,6 +53,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    volumes:
+      - kafka_data:/var/lib/kafka/data
 
 
   schema-registry:
@@ -118,8 +120,6 @@ services:
     networks:
       - confluent
 
-
-
   spark-master:
     image: bitnami/spark:3.4
     command: bin/spark-class org.apache.spark.deploy.master.Master
@@ -157,6 +157,8 @@ services:
       - CASSANDRA_PASSWORD=cassandra
     networks:
       - confluent
+    volumes:
+      - cassandra_data:/var/lib/cassandra
 
 
   prometheus:
@@ -174,3 +176,7 @@ services:
 
 networks:
   confluent:
+
+volumes:
+  cassandra_data:
+  kafka_data:
