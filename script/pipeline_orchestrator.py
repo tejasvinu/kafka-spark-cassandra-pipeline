@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 from cassandra.cluster import Cluster
 from cassandra import ConsistencyLevel
+from cassandra.query import BatchStatement, BatchType
 from confluent_kafka import Producer, Consumer
 from confluent_kafka.admin import AdminClient, NewTopic
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,7 +77,13 @@ def create_kafka_producer():
                 f.result()
             except Exception:
                 pass  # already exists or failed, we'll retry on produce
-        producer = Producer({'bootstrap.servers': KAFKA_BROKER})
+        producer_conf = {
+            'bootstrap.servers': KAFKA_BROKER,
+            'compression.type': 'gzip',
+            'linger.ms': 100,
+            'batch.num.messages': 10000
+        }
+        producer = Producer(producer_conf)
         return producer
     except Exception as e:
         print(f"Error creating Kafka producer: {e}")
@@ -133,38 +140,68 @@ def create_cassandra_session():
     return session
 
 def insert_metrics_to_cassandra(session, table, metrics_data, job_name):
-    """Durable insert with retries and alerts."""
     stmt = INSERT_STMTS[table]
-    for item in metrics_data:
+    # for very large payloads, use unlogged batch in chunks
+    if len(metrics_data) > 500:
+        for start in range(0, len(metrics_data), 500):
+            chunk = metrics_data[start:start+500]
+            batch = BatchStatement(consistency_level=ConsistencyLevel.LOCAL_QUORUM,
+                                   batch_type=BatchType.UNLOGGED)
+            for item in chunk:
+                metric = item.get("metric", {})
+                value_arr = item.get("value", [])
+                metric_name = metric.get("__name__", "unknown")
+                instance = metric.get("instance", "unknown")
+                labels = {k: v for k, v in metric.items()}
+                for k in ("__name__", "instance", "job"):
+                    labels.pop(k, None)
+                try:
+                    ts = datetime.fromtimestamp(float(value_arr[0]))
+                    val = float(value_arr[1])
+                except:
+                    ts, val = None, None
+                try:
+                    batch.add(stmt, (job_name, metric_name, instance, labels, ts, val))
+                except Exception as e:
+                    notify_failure(f"Batch insert failed for table {table}: {e}")
+            try:
+                session.execute(batch)
+            except Exception as e:
+                notify_failure(f"Batch insert failed for table {table}: {e}")
+        return
+    # batch in parallel threads
+    def write(item):
         metric = item.get("metric", {})
         value_arr = item.get("value", [])
         metric_name = metric.get("__name__", "unknown")
         instance = metric.get("instance", "unknown")
         labels = {k: v for k, v in metric.items()}
-        # Remove keys that are already columns
-        for k in ["__name__", "instance", "job"]:
+        for k in ("__name__", "instance", "job"):
             labels.pop(k, None)
-        # Parse timestamp and value
         try:
-            ts_float = float(value_arr[0])
-            ts = datetime.fromtimestamp(ts_float)
+            ts = datetime.fromtimestamp(float(value_arr[0]))
             val = float(value_arr[1])
-        except Exception:
-            ts = None
-            val = None
-        args = (job_name, metric_name, instance, labels, ts, val)
-        # retry up to 3 times
-        success = False
-        for attempt in range(1, 4):
+        except:
+            ts, val = None, None
+        try:
+            return session.execute_async(stmt, (job_name, metric_name, instance, labels, ts, val))
+        except Exception as e:
+            notify_failure(f"Async submit failed for {metric_name}: {e}")
+            return None
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for item in metrics_data:
+            futures.append(pool.submit(write, item))
+
+    # wait for results
+    for f in as_completed(futures):
+        fut = f.result()
+        if fut:
             try:
-                session.execute(stmt, args)
-                success = True
-                break
+                fut.result()
             except Exception as e:
-                print(f"Write attempt {attempt} failed for {metric_name}: {e}")
-                time.sleep(1)
-        if not success:
-            notify_failure(f"Permanent failure inserting {metric_name} for job {job_name}")
+                notify_failure(f"Cassandra write failed: {e}")
 
 # --- Kafka Consumer and Cassandra Sink ---
 def create_kafka_consumer(topics):
@@ -253,8 +290,8 @@ if __name__ == "__main__":
                     run_prometheus_kafka_etl()
                 except Exception as e:
                     print(f"Error during ETL cycle: {e}")
-                print("ETL cycle complete. Sleeping for 5 seconds before next cycle...")
-                time.sleep(5)
+                print("ETL cycle complete. Sleeping for 15 seconds before next cycle...")
+                time.sleep(15)
         except KeyboardInterrupt:
             print("\nETL process stopped by user.")
         finally:
@@ -270,8 +307,8 @@ if __name__ == "__main__":
                     run_prometheus_kafka_etl()
                 except Exception as e:
                     print(f"Error during ETL cycle: {e}")
-                print("ETL cycle complete. Sleeping for 5 seconds before next ETL cycle...")
-                time.sleep(5)
+                print("ETL cycle complete. Sleeping for 15 seconds before next ETL cycle...")
+                time.sleep(15)
         except KeyboardInterrupt:
             print("\nETL process stopped by user.")
         finally:
