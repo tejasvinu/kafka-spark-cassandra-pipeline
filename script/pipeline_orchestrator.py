@@ -257,7 +257,7 @@ def run_prometheus_kafka_etl():
     if not kafka_producer:
         print("Failed to create Kafka producer. Aborting ETL cycle.")
         return
-    # parallel scrape & produce
+    # parallel scrape and produce
     def process(src):
         data = scrape_prometheus_metrics(src["job_name"])
         if data:
