@@ -82,14 +82,28 @@ async def create_kafka_producer():
         return None
 
 async def produce_to_kafka(producer: AIOKafkaProducer, topic: str, data_list):
-    if not producer:
+    """Produce records concurrently in chunks to reduce latency for large metric sets."""
+    if not producer or not data_list:
         return
-    # Sequential awaits – could be optimized with asyncio.gather if needed.
-    for record in data_list:
-        try:
-            await producer.send_and_wait(topic, json.dumps(record).encode('utf-8'))
-        except Exception as e:
-            notify_failure(f"Produce error on topic {topic}: {e}")
+    CHUNK_SIZE = 500  # tuneable
+    errors = 0
+    for start in range(0, len(data_list), CHUNK_SIZE):
+        chunk = data_list[start:start+CHUNK_SIZE]
+        coros = []
+        for record in chunk:
+            try:
+                payload = json.dumps(record).encode('utf-8')
+                coros.append(producer.send_and_wait(topic, payload))
+            except Exception as e:
+                errors += 1
+                notify_failure(f"Enqueue produce error {e}")
+        if coros:
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    errors += 1
+    if errors:
+        print(f"Topic {topic}: {errors} produce errors out of {len(data_list)} messages")
 
 # --- Cassandra Insert ---
 def create_cassandra_session():
@@ -255,17 +269,26 @@ async def consume_kafka_and_insert_to_cassandra(stop_event: asyncio.Event):
 
 # --- Main Orchestration ---
 async def run_prometheus_kafka_etl(producer: AIOKafkaProducer):
-    """Scrape all sources concurrently and push to Kafka (async)."""
+    """Scrape all sources concurrently and push to Kafka with timing logs."""
+    cycle_start = time.time()
     print("Starting Prometheus scraping + Kafka production cycle...")
 
     async def process(src):
-        # run blocking scrape in thread
+        t0 = time.time()
         data = await asyncio.to_thread(scrape_prometheus_metrics, src["job_name"])
+        scrape_dur = time.time() - t0
+        count = len(data)
         if data:
+            p0 = time.time()
             await produce_to_kafka(producer, src["kafka_topic"], data)
+            prod_dur = time.time() - p0
+        else:
+            prod_dur = 0.0
+        print(f"Job {src['job_name']}: scraped {count} series in {scrape_dur:.2f}s, produced in {prod_dur:.2f}s")
 
     await asyncio.gather(*(process(s) for s in DATA_SOURCES))
-    print("Prometheus scraping + Kafka production cycle complete.")
+    total = time.time() - cycle_start
+    print(f"Prometheus scraping + Kafka production cycle complete in {total:.2f}s")
 
 async def etl_loop(stop_event: asyncio.Event):
     producer = await create_kafka_producer()
