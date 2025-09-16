@@ -288,6 +288,7 @@ if __name__ == "__main__":
             while True:
                 try:
                     run_prometheus_kafka_etl()
+                    print(f"[{datetime.now()}] ETL cycle completed.")
                 except Exception as e:
                     print(f"Error during ETL cycle: {e}")
                 print("ETL cycle complete. Sleeping for 15 seconds before next cycle...")
@@ -305,6 +306,7 @@ if __name__ == "__main__":
             while True:
                 try:
                     run_prometheus_kafka_etl()
+                    print(f"[{datetime.now()}] ETL cycle completed.")
                 except Exception as e:
                     print(f"Error during ETL cycle: {e}")
                 print("ETL cycle complete. Sleeping for 15 seconds before next ETL cycle...")
