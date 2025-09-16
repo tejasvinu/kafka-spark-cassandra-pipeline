@@ -1,15 +1,14 @@
 import json
 import time
-import requests
-import os
 import sys
+import asyncio
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 from cassandra.cluster import Cluster
 from cassandra import ConsistencyLevel
 from cassandra.query import BatchStatement, BatchType
-from confluent_kafka import Producer, Consumer
-from confluent_kafka.admin import AdminClient, NewTopic
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 
 # --- Configuration ---
 PROMETHEUS_URL = "http://localhost:9091"
@@ -64,46 +63,33 @@ def scrape_prometheus_metrics(job_name):
     notify_failure(f"Failed to scrape Prometheus for job {job_name} after 3 attempts")
     return []
 
-# --- Kafka Production ---
-def create_kafka_producer():
+############################
+# Kafka (aiokafka) Helpers #
+############################
+
+async def create_kafka_producer():
+    """Create and start an AIOKafkaProducer. Rely on broker auto-create for topics."""
     try:
-        # ensure topics exist
-        admin = AdminClient({'bootstrap.servers': KAFKA_BROKER})
-        topics = [src['kafka_topic'] for src in DATA_SOURCES]
-        new_topics = [NewTopic(t, num_partitions=1, replication_factor=1) for t in topics]
-        fs = admin.create_topics(new_topics, request_timeout=5)
-        for t, f in fs.items():
-            try:
-                f.result()
-            except Exception:
-                pass  # already exists or failed, we'll retry on produce
-        producer_conf = {
-            'bootstrap.servers': KAFKA_BROKER,
-            'compression.type': 'gzip',
-            'linger.ms': 100,
-            'batch.num.messages': 10000
-        }
-        producer = Producer(producer_conf)
+        producer = AIOKafkaProducer(
+            bootstrap_servers=KAFKA_BROKER,
+            compression_type="gzip",
+            linger_ms=100
+        )
+        await producer.start()
         return producer
     except Exception as e:
-        print(f"Error creating Kafka producer: {e}")
+        notify_failure(f"Failed to start aiokafka producer: {e}")
         return None
 
-def delivery_report(err, msg):
-    if err is not None:
-        print(f"Message delivery failed for topic {msg.topic()}: {err}")
-
-def produce_to_kafka(producer, topic, data_list):
+async def produce_to_kafka(producer: AIOKafkaProducer, topic: str, data_list):
     if not producer:
-        print(f"Kafka producer not available for topic {topic}.")
         return
+    # Sequential awaits – could be optimized with asyncio.gather if needed.
     for record in data_list:
         try:
-            message = json.dumps(record).encode('utf-8')
-            producer.produce(topic, value=message, callback=delivery_report)
+            await producer.send_and_wait(topic, json.dumps(record).encode('utf-8'))
         except Exception as e:
-            print(f"Error producing message to Kafka topic {topic}: {e}")
-    producer.flush(timeout=10)
+            notify_failure(f"Produce error on topic {topic}: {e}")
 
 # --- Cassandra Insert ---
 def create_cassandra_session():
@@ -204,122 +190,141 @@ def insert_metrics_to_cassandra(session, table, metrics_data, job_name):
                 notify_failure(f"Cassandra write failed: {e}")
 
 # --- Kafka Consumer and Cassandra Sink ---
-def create_kafka_consumer(topics):
-    # ensure topics exist before subscribing
-    admin = AdminClient({'bootstrap.servers': KAFKA_BROKER})
-    fs = admin.create_topics([NewTopic(t, num_partitions=1, replication_factor=1) for t in topics], request_timeout=5)
-    for t, f in fs.items():
-        try:
-            f.result()
-        except Exception:
-            pass
-    consumer_conf = {
-        'bootstrap.servers': KAFKA_BROKER,
-        'group.id': 'metrics_cassandra_sink',
-        'auto.offset.reset': 'earliest'
-    }
-    consumer = Consumer(consumer_conf)
-    consumer.subscribe(topics)
-    return consumer
-
-def consume_kafka_and_insert_to_cassandra():
-    print("Starting Kafka consumer to insert metrics into Cassandra...")
+async def consume_kafka_and_insert_to_cassandra(stop_event: asyncio.Event):
+    """Consume metrics from Kafka and insert into Cassandra asynchronously (I/O wise)."""
+    print("Starting aiokafka consumer to insert metrics into Cassandra...")
     session = create_cassandra_session()
     topic_table_map = {src["kafka_topic"]: (src["cassandra_table"], src["job_name"]) for src in DATA_SOURCES}
     topics = list(topic_table_map.keys())
-    consumer = create_kafka_consumer(topics)
+    consumer = AIOKafkaConsumer(
+        *topics,
+        bootstrap_servers=KAFKA_BROKER,
+        group_id='metrics_cassandra_sink',
+        auto_offset_reset='earliest'
+    )
+    await consumer.start()
+
+    loop = asyncio.get_running_loop()
+
+    def insert_single(metric_obj, table, job_name):
+        # reuse logic from earlier multi-insert path
+        stmt = INSERT_STMTS[table]
+        metric = metric_obj.get("metric", {})
+        value_arr = metric_obj.get("value", [])
+        metric_name = metric.get("__name__", "unknown")
+        instance = metric.get("instance", "unknown")
+        labels = {k: v for k, v in metric.items()}
+        for k in ("__name__", "instance", "job"):
+            labels.pop(k, None)
+        try:
+            ts = datetime.fromtimestamp(float(value_arr[0]))
+            val = float(value_arr[1])
+        except Exception:
+            ts, val = None, None
+        try:
+            future = session.execute_async(stmt, (job_name, metric_name, instance, labels, ts, val))
+            future.result()  # wait to surface errors
+        except Exception as e:
+            notify_failure(f"Cassandra insert failed: {e}")
+
     try:
-        while True:
+        while not stop_event.is_set():
             try:
-                msg = consumer.poll(1.0)
-                if msg is None:
+                # getmany allows some batching. timeout to allow cancellation checks.
+                results = await consumer.getmany(timeout_ms=1000, max_records=500)
+                if not results:
                     continue
-                if msg.error():
-                    print(f"Kafka error: {msg.error()}")
-                    continue
-                data = json.loads(msg.value().decode('utf-8'))
-                topic = msg.topic()
-                cassandra_table, job_name = topic_table_map[topic]
-                insert_metrics_to_cassandra(session, cassandra_table, [data], job_name)
+                for tp, messages in results.items():
+                    table, job_name = topic_table_map[tp.topic]
+                    for msg in messages:
+                        try:
+                            data = json.loads(msg.value.decode('utf-8'))
+                        except Exception as e:
+                            notify_failure(f"JSON decode failed: {e}")
+                            continue
+                        # Run blocking Cassandra write in default thread pool
+                        await loop.run_in_executor(None, insert_single, data, table, job_name)
             except Exception as e:
-                print(f"Error in Kafka consumer loop: {e}")
-                time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nKafka consumer stopped by user.")
+                notify_failure(f"Error in consumer loop: {e}")
+                await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        print("Kafka consumer task cancelled.")
     finally:
-        consumer.close()
+        await consumer.stop()
+        print("Kafka consumer stopped.")
 
 # --- Main Orchestration ---
-def run_prometheus_kafka_etl():
-    """Main function to scrape Prometheus and produce to Kafka."""
-    print("Starting Prometheus scraping and Kafka production cycle...")
-    kafka_producer = create_kafka_producer()
-    if not kafka_producer:
-        print("Failed to create Kafka producer. Aborting ETL cycle.")
-        return
-    # parallel scrape and produce
-    def process(src):
-        data = scrape_prometheus_metrics(src["job_name"])
+async def run_prometheus_kafka_etl(producer: AIOKafkaProducer):
+    """Scrape all sources concurrently and push to Kafka (async)."""
+    print("Starting Prometheus scraping + Kafka production cycle...")
+
+    async def process(src):
+        # run blocking scrape in thread
+        data = await asyncio.to_thread(scrape_prometheus_metrics, src["job_name"])
         if data:
-            produce_to_kafka(kafka_producer, src["kafka_topic"], data)
-    with ThreadPoolExecutor(max_workers=len(DATA_SOURCES)) as ex:
-        tasks = [ex.submit(process, s) for s in DATA_SOURCES]
-        for t in as_completed(tasks):
-            try: t.result()
-            except Exception as e: print(f"ETL error: {e}")
-    print("Prometheus scraping and Kafka production cycle complete.")
+            await produce_to_kafka(producer, src["kafka_topic"], data)
+
+    await asyncio.gather(*(process(s) for s in DATA_SOURCES))
+    print("Prometheus scraping + Kafka production cycle complete.")
+
+async def etl_loop(stop_event: asyncio.Event):
+    producer = await create_kafka_producer()
+    if not producer:
+        notify_failure("Cannot start ETL loop without producer")
+        return
+    try:
+        while not stop_event.is_set():
+            try:
+                await run_prometheus_kafka_etl(producer)
+                print(f"[{datetime.now()}] ETL cycle completed.")
+            except Exception as e:
+                notify_failure(f"ETL cycle error: {e}")
+            if stop_event.is_set():
+                break
+            print("Sleeping 15s before next ETL cycle...")
+            await asyncio.sleep(15)
+    except asyncio.CancelledError:
+        print("ETL loop task cancelled.")
+    finally:
+        try:
+            await producer.stop()
+        except Exception:
+            pass
+        print("Producer stopped.")
+
+async def cassandra_loop(stop_event: asyncio.Event):
+    await consume_kafka_and_insert_to_cassandra(stop_event)
+
+async def run_all_mode():
+    stop_event = asyncio.Event()
+    consumer_task = asyncio.create_task(cassandra_loop(stop_event))
+    etl_task = asyncio.create_task(etl_loop(stop_event))
+    try:
+        await asyncio.gather(etl_task, consumer_task)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        stop_event.set()
+        consumer_task.cancel()
+        etl_task.cancel()
+        await asyncio.gather(consumer_task, etl_task, return_exceptions=True)
+        print("All mode tasks stopped.")
 
 if __name__ == "__main__":
-    mode = None
-    if len(sys.argv) > 1:
-        mode = sys.argv[1]
-
-    if mode is None or mode == "all":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+    print(f"Selected mode: {mode}")
+    try:
         if mode == "all":
-            print("Running in 'all' mode: Starting ETL process and Kafka->Cassandra consumer.")
+            print("Running in 'all' mode (ETL loop + Cassandra sink). Ctrl+C to stop.")
+            asyncio.run(run_all_mode())
+        elif mode == "etl":
+            print("Running ETL loop only. Ctrl+C to stop.")
+            asyncio.run(etl_loop(asyncio.Event()))
+        elif mode == "cassandra":
+            print("Running Cassandra sink only. Ctrl+C to stop.")
+            stop_event = asyncio.Event()
+            asyncio.run(consume_kafka_and_insert_to_cassandra(stop_event))
         else:
-            print("No mode specified, defaulting to 'all' mode: Starting ETL process and Kafka->Cassandra consumer.")
-
-        # Start Kafka consumer in a subprocess
-        from multiprocessing import Process
-        consumer_proc = Process(target=consume_kafka_and_insert_to_cassandra)
-        consumer_proc.start()
-        try:
-            while True:
-                try:
-                    run_prometheus_kafka_etl()
-                    print(f"[{datetime.now()}] ETL cycle completed.")
-                except Exception as e:
-                    print(f"Error during ETL cycle: {e}")
-                print("ETL cycle complete. Sleeping for 15 seconds before next cycle...")
-                time.sleep(15)
-        except KeyboardInterrupt:
-            print("\nETL process stopped by user.")
-        finally:
-            consumer_proc.terminate()
-            consumer_proc.join()
-            print("Exiting 'all' mode.")
-    elif mode == "etl":
-        print("Running in ETL mode (Prometheus Scrape -> Kafka Produce) in a loop.")
-        print("Press Ctrl+C to stop.")
-        try:
-            while True:
-                try:
-                    run_prometheus_kafka_etl()
-                    print(f"[{datetime.now()}] ETL cycle completed.")
-                except Exception as e:
-                    print(f"Error during ETL cycle: {e}")
-                print("ETL cycle complete. Sleeping for 15 seconds before next ETL cycle...")
-                time.sleep(15)
-        except KeyboardInterrupt:
-            print("\nETL process stopped by user.")
-        finally:
-            print("Exiting ETL mode.")
-    elif mode == "cassandra":
-        print("Running in Cassandra sink mode (Kafka Consume -> Cassandra Insert)")
-        consume_kafka_and_insert_to_cassandra()
-    else:
-        print(f"Unknown mode: {sys.argv[1]}. Use 'etl', 'cassandra', or 'all' (or no arguments for 'all').")
-        print("Example for 'all' mode: python script/pipeline_orchestrator.py")
-        print("Example for ETL only: python script/pipeline_orchestrator.py etl")
-        print("Example for Cassandra sink only: python script/pipeline_orchestrator.py cassandra")
+            print(f"Unknown mode: {mode}. Use 'etl', 'cassandra', or 'all'.")
+    except KeyboardInterrupt:
+        print("Interrupted by user – shutting down.")
